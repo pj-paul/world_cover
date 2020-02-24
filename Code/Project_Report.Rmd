@@ -1,0 +1,475 @@
+---
+title: "Data Science: Project Report -- PJ Paul"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+  word_document: default
+---
+
+```{r include=FALSE}
+# Setting Knit options for the document
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+
+## Load libraries
+library(tidyverse)
+library(ggplot2)
+library(janitor)
+library(gt)
+
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+mytheme <- theme_minimal() +
+           theme(axis.line.y = element_blank(), axis.ticks = element_blank(), 
+                 axis.line.x = element_line(color = "black"),
+                axis.title.x = element_text(size=12, hjust = 0.5), 
+                plot.title = element_text(hjust = 0,face = "bold"),
+                plot.caption = element_text(hjust = 0, face= "italic"),
+                legend.position = "bottom", legend.direction = "vertical",
+                legend.text.align = 0, legend.title = element_blank(),
+                legend.box.margin = margin(t = -10, r = 20, b = 0, l = 30.4, unit = "pt"),
+                panel.grid = element_blank(),
+                plot.background = element_blank(),
+                plot.margin = margin(t = 0, r = 0, b = 0, l = 0, unit = "cm"))
+
+theme_set(mytheme)
+
+```
+
+```{r include=FALSE}
+## Setting up the code
+username = "paulpj"
+conn <- DBI::dbConnect(RPostgres::Postgres(), dbname = "WC_Dump", user=username, password="password")
+contracts_db <- tbl(conn, "contracts")
+locations_db <- tbl(conn, "locations")
+joint_db <- tbl(conn, "joint_table")
+
+
+## Creating a comprehensive table for Maize
+joint_db %>%  filter(product_code == "MAIZ-GHA-20-ST01") %>% 
+  mutate(yield_kg = yield_bags*100) %>% 
+  mutate(yield_max_kg = yield_max_bags*100) %>% 
+  mutate(ypa = yield_kg/planted_acres) %>% 
+  mutate(ypa_max = yield_max_kg/planted_acres) %>% 
+  mutate(fert_pa = fert_bags/planted_acres) %>% 
+  mutate(call_status_final = case_when(
+    call_status == "connected" ~ 1,
+    is.na(call_status) ~ NA,
+    TRUE ~ 0
+  ) ) %>% 
+  mutate(payout_status_final = 
+           case_when(
+             status == "payout due" | status == "payout initiated" | status == "paid out (in part)" 
+             | status == "paid out" ~ 1,
+             TRUE ~ 0
+           ) ) %>% 
+  mutate(yield_loss_recode = 
+           case_when(
+             yield_lost == "1/4"  ~ 0.25,
+             yield_lost == "1/3"  ~ 0.33,
+             yield_lost == "1/2"  ~ 0.5,
+             yield_lost == "2/3"  ~ 0.66,
+             yield_lost == "3/4"  ~ 0.75,
+             yield_lost == "all"  ~ 1.00,
+             yield_lost == "none" ~ 0.00,
+             is.na(yield_lost) ~ NA) ) %>% 
+  mutate(claim_eligible = 
+           case_when(
+             yield_loss_recode < 0.5 ~ 0,
+             yield_loss_recode >= 0.5 ~ 1,
+             is.na(yield_lost) ~ NA
+           )) -> joint_table_maize
+
+contracts_db %>% 
+  filter(season %in% c("Y2019S1", "Y2019S2")) %>%   
+  mutate(payout_status_final = 
+  case_when( status == "payout due" | status == "payout initiated" | 
+             status == "paid out (in part)" | status == "paid out" ~ 1,
+            TRUE ~ 0
+            ) ) %>% inner_join(locations_db, by = "loc_id") -> contracts_table
+```
+
+# Executive Summary
+
+
+1. WorldCover's 2019 survey sample exhibits significant variation in yield rates within and across regions. This suggests a high degree of farmer-level and region-level variability in yields. 
+2. WorldCover's insurance policy has an excellent loss ratio of ~70%, and potential for deeper penetration in the Northern and Upper East regions.
+3. WorldCover's policies suffer significantly from basis risk. The probability of a payout being triggered conditional on rain-induced loss is less than 50%. 
+4. The quality of WorldCover's 2019 sample data suffers from missing data and potential strategic responses from policy-holders. The high degree of basis risk requires further triangulation using other data sources before it can be confirmed. 
+5. The existence and extent of basis risk needs to be confirmed and studied as part of urgent further research. 
+
+*** 
+
+# 1. General context of World Cover operations
+
+## Variation in yield rates in Ghana
+
+<br> 
+Global Yield Gap Atlas estimated Ghanas maize yield to be between 550 - 730 kg per acre. The median for the maximum possible yield as reported by WorldCover's survey respondents is also around 700 kg per acre. We may then conclude that 700 kg per acre is the upper limit of rainfed maize yield, with 550 kg per acre being a normal rate of yield, and anything below 400 kg per acre being a low rate of yield. 
+
+The table below highlights the variation in WorldCover's telephone survey sample. The variation between regions, as well as within regions is evident. However, these yield figures are affected by weather shocks, and the consequent loss of harvest.
+
+<br>
+
+```{r}
+joint_table_maize %>% group_by(reg_nm) %>% 
+  summarise(mean=mean(ypa), sd=sd(ypa), n=n()) %>% mutate(cov=mean/sd) %>% 
+  select(reg_nm, mean, sd, cov, n) %>% gt() %>% 
+  tab_header(title = md("**Region-wise variation in Maize yield**")) %>% 
+  fmt_number(columns = 2:4, decimals=2) %>%   
+  cols_label(
+    reg_nm = html("Region"),
+    n = html("N"),
+    mean = html("Mean yield"),
+    sd = html("Standrd deviation <br> of yield"),
+    cov = html("Coefficient of <br> variation")
+  ) %>% 
+  cols_align(align="center",columns = 2:4)
+```
+<br>
+
+The following table provides harvest-loss adjusted yield-estimated for Maize in WorldCover's sample. The large coefficient of variation with each loss-category suggests a high degree of variability between farmers in the sample. 
+
+<br> 
+
+```{r}
+joint_df_maize <- joint_table_maize %>% collect() 
+
+joint_df_maize %>% 
+  mutate(yield_lost_factor=factor(yield_lost, levels = c("none","1/4","1/3","1/2","2/3","3/4","all")))  %>% arrange((yield_lost_factor)) %>% 
+  group_by(yield_lost_factor) %>% 
+  summarise(mean=mean(ypa, na.rm = TRUE), sd=sd(ypa, na.rm = TRUE), n=n()) %>% mutate(cov=mean/sd)  %>% 
+  select(yield_lost_factor, mean, sd, cov, n) %>% gt() %>% 
+  tab_header(title = md("**Harvest loss-wise variation in Maize yield**")) %>% 
+  fmt_number(columns = 2:4, decimals=2) %>%   
+  cols_label(
+    yield_lost_factor = html("Harvest loss %"),
+    n = html("N"),
+    mean = html("Mean yield"),
+    sd = html("Standrd deviation <br> of yield"),
+    cov = html("Coefficient of <br> variation")
+  ) %>% 
+  cols_align(align="center",columns = 2:4)
+```
+
+<br>
+
+
+## Factors influencing variation in yield rates
+
+Although there is strong empirical evidence for the effect of individual, and agronomic factors in yield rates generated by farmers, the high rates of missing data in WorldCover's sample will make it difficult to identify these effects in WorldCover's sample. However, we can still try and fit a regression model using data on phone, fertiliser usage, acerage planted, and the region of residence. 
+
+```{r}
+joint_table_maize %>% select(ypa,cht_phone,fert_bags,planted_acres, reg_nm) %>% collect() %>%
+  mutate(reg_nm = as.factor(reg_nm)) -> regression_data
+regression_model <- lm(ypa ~ cht_phone + fert_bags + planted_acres +reg_nm, data=regression_data )
+summary(regression_model)
+```
+<br> 
+The following table contains the result of our regression. We can see that fertiliser usage and acerage under cultivation strongly affect the yield rates. However, most of the estimates are noisy making it difficult to draw any conclusions. 
+
+<br> 
+
+```{r}
+gtsummary::tbl_regression(regression_model)
+```
+
+
+
+
+*** 
+
+# 2. Business performance of WC policies
+
+For the 2019 season, WorldCover sold 2279 weather insurance policies for maize. Ghana's Northern Province was the biggest market for WorldCover's policies, also the premium amount per policy here was small. 
+
+In 2019, WorldCover policies had a claims ratio of ~45% and a loss ratio (payout-to-premium ratio) of ~70%, netting a surplus of ~$1.5 per policy sold. A 70% loss-ratio is an outstanding result for any crop-insurer-- for instance, the record corn and soybean yields in the USA in 2018 produced loss-ratios of 69%. The challenge would be to maintain similar ratios as WorldCover scales its operations and starts processing larger volume of policies.
+
+<br> 
+
+```{r echo=FALSE}
+
+# Total amount collected
+# contracts_table %>% summarise(total_premium_collected = sum(amount_usd),
+#                               total_premium_paid_out = sum(payout_usd)) %>% mutate(net = total_premium_collected - total_premium_paid_out)
+
+
+contracts_table %>% group_by(reg_nm) %>% summarise(total_premium_collected = sum(amount_usd),
+                              total_premium_paid_out = sum(payout_usd), n=n()) %>% mutate(net = total_premium_collected - total_premium_paid_out) %>% select(reg_nm, n, total_premium_collected, total_premium_paid_out, net) %>% arrange(desc(n)) %>% collect() %>%  janitor::adorn_totals("row") %>% 
+  gt() %>%
+  tab_header(title = md("**Region-wise performance of WC policies**")) %>% 
+  #fmt_number(columns = 3:5, decimals=2) %>%   
+  fmt_currency(columns=3:5, decimals = 2) %>% 
+  cols_label(
+    reg_nm = html("Region"),
+    n = html("Policies <br> Sold"),
+    total_premium_collected = html("Premium <br> Collected"),
+    total_premium_paid_out = html("Pay-outs"),
+    net = html("Net financial <br> position")
+  )
+```
+<br> 
+
+Insurance penetration, in relation to cultivated land and fertilizers used also shows differences across regions. The Northern and Upper East provinces seem to be under-penetrated with respect to premium. There is potential for further growth in these regions. 
+
+<br> 
+
+```{r message=FALSE, warning=FALSE}
+joint_table_maize %>% filter(planted_acres > 0) %>%
+  mutate(ins_per_acre = amount_usd/planted_acres) %>% group_by(reg_nm) %>% summarise(mean=mean(ins_per_acre),sd=sd(ins_per_acre),n=n()) %>% mutate(metric="acres") %>% collect() -> temp0
+
+joint_table_maize %>% filter(fert_bags > 0) %>%
+  mutate(ins_per_fert = amount_usd/fert_bags) %>% group_by(reg_nm) %>%
+  summarise(mean=mean(ins_per_fert),sd=sd(ins_per_fert),n=n()) %>% mutate(metric="fert") %>%  collect() -> temp1
+
+bind_rows(temp0, temp1)  %>% ggplot(aes(x=reg_nm, y=mean, fill=metric)) + geom_bar(stat="identity", position = "dodge")  + xlab("") + ylab("Insurance premium sped \n per unit area and fertilizer") +theme(legend.direction  = "vertical") + theme(legend.position = "bottom") +
+  scale_fill_manual(values=cbPalette, labels=c("Planted acres", "Bags of fertilizer used")) +
+  labs(title = "Spending on insurance relative to other inputs varies across regions", subtitle ="Room for growth in NP and UE regions.")
+
+```
+
+<br>
+
+Even though NP and UE regions maybe relatively under-developed, their spending on fertilisers per acre cultivated, and total area cultivated are similar to AH and BA regions. The table below highlights this similarity. 
+
+<br>
+
+```{r message=FALSE, warning=FALSE}
+joint_table_maize %>% filter(planted_acres > 0) %>%
+  mutate(fert_per_acre = fert_bags/planted_acres) %>% group_by(reg_nm) %>% summarise(fert_mean=mean(fert_per_acre),fert_sd=sd(fert_per_acre),fert_n=n()) %>% mutate(metric="fert") %>% collect() -> temp_1
+
+joint_table_maize %>% group_by(reg_nm) %>% summarise(acre_mean=mean(planted_acres),acre_sd=sd(planted_acres),acre_n=n()) %>% mutate(metric="acres") %>% collect() -> temp_2
+
+bind_cols(temp_1, temp_2) %>% 
+  select(reg_nm, fert_mean, acre_mean, fert_n) %>%  gt() %>%
+  tab_header(title = md("**Region-wise fertilizer usage and area under cultivation**")) %>% 
+  fmt_number(columns = 2:3, decimals=2) %>%   
+  cols_label(
+    reg_nm = html("Region"),
+    fert_mean = html("Average fertilizer bags <br> per acre"),
+    acre_mean = html("Average acres <br> cultivated"),
+    fert_n = html("N")) %>% 
+  cols_align(align="center",columns = 2:3)
+```
+
+
+*** 
+
+# 3. Product performance of WC policies
+
+To continue to maintain tight loss-ratios, while scaling policy volumes, WorldCover will need to keep a tight check on the basis risk involved in their operations. My analysis of the 2019 season's coverage indicate significant basis risk both in the probability of payouts and the value of payouts. For this analysis, I have assumed the accuracy of the loss rates as reported by WorldCover policy-holders during the telephonic survey. However, there are some suggestions of strategic responses by policy-holders (detailed in Section 4 on Data Quality).
+
+<br>
+
+## Basis risk-- probability of payouts
+
+<br>
+```{r}
+joint_table_maize %>% collect() %>%
+  count(yield_lost, payout_status_final) %>%
+  group_by(yield_lost) %>% mutate(yield_status_count = sum(n)) %>% 
+  ungroup() %>% filter(payout_status_final==1) %>% 
+  mutate(payout_rate = n/yield_status_count) %>% 
+  select(yield_lost, n, payout_rate,yield_status_count) %>% filter(!is.na(yield_lost)) %>% mutate(yield_lost_factor=factor(yield_lost, levels = c("none","1/4","1/3","1/2","2/3","3/4","all"))) %>% arrange((yield_lost_factor)) %>% 
+  select(yield_lost_factor, payout_rate, yield_status_count) %>% 
+  gt()  %>% 
+  tab_header(
+    title = md("**Yield loss-wise payout rates of WC policies**")) %>% 
+  fmt_percent(columns = 2, decimals=1) %>%   
+  cols_label(
+    yield_lost_factor = html("Yield lost <br> Proportion"),
+    payout_rate = html("Payout Rate"),
+    yield_status_count = html("No of clients<br>reporting loss")
+  )  %>% 
+  cols_align(align="center",columns = 2:3)
+
+```
+<br>
+
+The following graph indicates the basis risk faced by each policy-holder in receving a payout, irrespective of the value of the payout. The graph is created by plotting the percentage of harvest losss as reported by the policy-holder, against a loess estimate of the conditional probability of receiving a payout given the loss suffered. The graph suggests that the probability of receiving a payout if less than 50% in most cases.
+
+<br>
+
+```{r}
+joint_table_maize %>% filter(!is.na(yield_loss_recode)) %>% collect() %>%  ggplot(aes(x=yield_loss_recode, y=payout_status_final)) +  geom_jitter(size=2, alpha=0.4, position = position_jitter(height = .02)) + stat_smooth(alpha=0.1, method="loess", mapping = aes(weight=weight), colour="grey", size=0.5) + ggtitle("Basis risk in payout probability") + 
+  ylab("Probability of payout") + xlab("% of harvest loss") + 
+  labs(caption = "Weighted loess regression of self-reported harvest loss against final payout status")
+```
+
+<br>
+
+
+```{r}
+
+# Payout probability contracts table v/s distrct-level loss from cryield
+
+joint_table_maize %>% summarise(reg_mean_yield_loss = mean(yield_loss_recode)) %>%  collect() -> aggregate_yield_loss
+  
+joint_table_maize %>% group_by(dist_id, reg_nm) %>% summarise(dist_mean_yield_loss = mean(yield_loss_recode), n=n()) -> dist_yield_losess
+
+joint_table_maize %>% group_by(reg_nm) %>% summarise(reg_mean_yield_loss = mean(yield_loss_recode), n=n())  -> reg_yield_losess
+
+
+contracts_table %>% group_by(dist_id) %>% summarise(dist_mean_payout = mean(payout_status_final), n=n()) -> dist_payouts
+
+contracts_table %>% group_by(reg_nm) %>% summarise(reg_mean_payout = mean(payout_status_final), n=n()) -> reg_payouts
+
+```
+<br> 
+
+We can triangulate the finding of high basis risk in payout probability via other analyses as well. In the following figure, I plot the percentage of policies that were paid out in a district against the estimated harvest loss suffered in the district. We find that, similar to earlier, the probability of receiving a payout is less that 50% across the board. Even at the aggregate level of the district, payouts do not seem to be responsive to reported harvest losses.
+
+<br>
+
+```{r}
+
+dist_yield_losess %>% inner_join(dist_payouts, by = "dist_id") %>% ggplot(aes(x=dist_mean_yield_loss,y=dist_mean_payout)) +  geom_jitter(size=2, alpha=0.4, position = position_jitter(height = .02)) + stat_smooth(alpha=0.1, method="loess", colour="grey", size=0.5) + 
+  ggtitle("Basis risk in payout probability:\nEstimated district losss and actual contract payouts") + 
+  ylab("Probability of payout") + xlab("% of harvest lost") + 
+  labs(caption = "Each point represents one district in the contracts table.\nFor each district, the % of harvest loss was estimated from survey data,\nand % of payouts was estimated from the contracts table.")
+
+```
+
+<br>
+
+I repeat the same analysis for regional payouts and yield loss averages below. The table below once again suggest that payout rates are not sufficiently sensitive to the reported loss rates. 
+
+<br>
+
+```{r include=TRUE}
+contracts_table %>% 
+    summarise(mean_payout=mean(payout_status_final, na.rm = TRUE), sd_payout = sd(payout_status_final, na.rm = TRUE), n=n()) %>% arrange(desc(n)) %>% collect() %>% mutate(reg_nm = "Aggregate") -> temp_0
+
+contracts_table %>% group_by(reg_nm) %>% 
+    summarise(mean_payout=mean(payout_status_final, na.rm = TRUE), sd_payout = sd(payout_status_final, na.rm = TRUE), n=n()) %>% arrange(desc(n)) %>% collect() -> temp_1
+
+bind_rows(temp_1,temp_0) -> regional_payout_averages
+
+rm(temp_0, temp_1)
+
+reg_yield_losess %>% inner_join(reg_payouts, by = "reg_nm") %>%  collect() %>% select(reg_nm,reg_mean_yield_loss) %>% right_join(regional_payout_averages, by="reg_nm")%>% 
+  select(reg_nm, n, mean_payout,reg_mean_yield_loss) %>%
+  mutate(reg_mean_yield_loss = replace(reg_mean_yield_loss, reg_nm == "Aggregate", as.numeric(aggregate_yield_loss))) %>% 
+  gt() %>% 
+  tab_header(
+    title = md("**Region-wise payout rates of WC policies**")) %>% 
+  fmt_percent(columns = 3:4, decimals=1) %>%   
+  cols_label(
+    reg_nm = html("Region"),
+    n = html("Policies <br> Sold"),
+    mean_payout = html("Payout Rate"),
+    reg_mean_yield_loss = html("Average yield loss")
+  )  %>% 
+  cols_align(align="center",columns = 3:4)
+
+```
+
+<br>
+
+## Basis risk-- payout value
+
+For a policy-holder, the actual value of the payout is more important than the mere triggering of a payout. In the following figure, I estimate the market value of lost harvest and compare it to the payout value the policy-holder received. Similar to earlier, I find that the payout value is only a small proportion of the lost value of harvest. 
+
+<br>
+
+However, I'm not sure if WorldCover policies are entirely reponsible for the gap between payout and loss value we see here. For instance, if policy holders under-insured themselves, this could result in lower values of payouts. 
+
+<br>
+
+```{r include = FALSE, message=FALSE, warning=FALSE}
+
+joint_table_maize %>% filter(sold_price > 0) %>% group_by(dist_id) %>% 
+  mutate(dist_avg_price = mean(sold_price), n = n()) %>% ungroup() %>% 
+  select(dist_id, dist_avg_price, n) %>%
+  distinct(.keep_all = TRUE) -> dist_maize_prices
+
+
+
+cedis_to_usd = 5.32
+
+joint_table_maize %>% filter(yield_loss_recode > 0 & yield_loss_recode < 1) %>% 
+  inner_join(dist_maize_prices,by="dist_id") %>% 
+  mutate(sale_price_estimate_usd = case_when(
+    is.na(sold_price) ~ dist_avg_price/cedis_to_usd,
+    sold_price == 0 ~ dist_avg_price/cedis_to_usd,
+    TRUE ~ sold_price/cedis_to_usd
+  )) %>% summarise(mean(sale_price_estimate_usd))
+
+joint_table_maize %>% filter(yield_loss_recode > 0 & yield_loss_recode < 1) %>% 
+  inner_join(dist_maize_prices,by="dist_id") %>% 
+  mutate(sale_price_estimate_usd = case_when(
+    is.na(sold_price) ~ dist_avg_price/cedis_to_usd,
+    sold_price == 0 ~ dist_avg_price/cedis_to_usd,
+    TRUE ~ sold_price/cedis_to_usd
+  )) %>% 
+  mutate(loss_value = sale_price_estimate_usd*yield_bags*yield_loss_recode/(1-yield_loss_recode)) %>% 
+  mutate(payout_value = payout_usd - amount_usd) %>% 
+  # Is this accurate? Should we not adjust payouts in case of pending payouts.
+  filter(loss_value < 1500) %>% 
+  summarise(mean_loss = mean(loss_value), sd_loss = sd(loss_value),
+            mean_payout = mean(payout_value), sd_payout = sd(payout_value))
+```
+
+```{r}
+
+joint_table_maize %>% filter(yield_loss_recode > 0 & yield_loss_recode < 1) %>% 
+  inner_join(dist_maize_prices,by="dist_id") %>% 
+  mutate(sale_price_estimate_usd = case_when(
+    is.na(sold_price) ~ dist_avg_price/cedis_to_usd,
+    sold_price == 0 ~ dist_avg_price/cedis_to_usd,
+    TRUE ~ sold_price/cedis_to_usd
+  )) %>% 
+  mutate(loss_value = sale_price_estimate_usd*yield_bags*yield_loss_recode/(1-yield_loss_recode)) %>% 
+  mutate(payout_value = payout_usd - amount_usd) %>%
+  filter(loss_value < 1500) %>% 
+  ggplot(aes(x=loss_value, y = payout_value)) + geom_point() + stat_smooth(alpha=0.1, method="loess", mapping = aes(weight=weight), colour="grey", size=0.5) + ggtitle("Basis risk in payout value") + ylab("Value of payout $") + xlab("Value of harvest loss $") + 
+  labs(caption = "Each point represents a policy holder.\nHarvest loss value calculated as: sale_price_estimate_usd*yield_bags*yield_loss/(1-yield_loss)\nPayout value calculated as: payout received - premium paid\nSample restricted to loss < $1,500")
+```
+
+<br>
+
+
+
+*** 
+
+# 4. Note on data quality
+<br>
+The quality of the 2019 sampled data has room for significant improvement. Problems include large levels of missingness in data, potential bias due to survey non-response, and strategic responsses from survey respondents. 
+
+- Missing data: Several columsn in the customer table have high degress of missing data. 
+```{r echo=FALSE}
+joint_df_maize  %>% filter(call_status_final == 1) %>% 
+  dlookr::diagnose() %>%
+  arrange(desc(missing_percent)) %>% filter(missing_percent > 20) %>% 
+  print(n = 15) %>% gt()
+```
+- Non-reponse and recalculating weights: About 30% of the sample did not respond to the phone survey. We should verify if there are systematic patterns in non-response. On first glance however, the data does seem to be balanced across regions at least. 
+
+```{r echo=FALSE, include=FALSE, message=FALSE}
+contracts_table %>% count(reg_nm) %>% collect() %>% mutate(prop=prop.table(n)) 
+joint_table_maize %>% count(reg_nm) %>% collect() %>% mutate(prop=prop.table(n))
+joint_table_maize %>% filter(call_status_final==1) %>%  count(reg_nm) %>% collect() %>% mutate(prop=prop.table(n))
+```
+
+- Strategic reponses to the survey: We can notice that as policy-holders reporting higher fractions of harvest loss, also report higher values of maximum potential yields. This might suggest attempts at strategic responses.
+
+<br>
+
+```{r echo=FALSE}
+joint_df_maize %>% 
+  mutate(yield_lost_factor=factor(yield_lost, levels = c("none","1/4","1/3","1/2","2/3","3/4","all"))) %>% 
+  group_by(yield_lost_factor) %>% 
+  summarise(mean_yield_max=mean(ypa_max), sd=sd(ypa_max), n=n()) %>%
+  mutate(cov= mean_yield_max/sd) %>% gt()
+```
+
+
+*** 
+
+# 5. Questions for further research: Basis Risk
+
+Without doubt, the question of basis risk needs to be researched further. The reported harvest losses must be confirmed via alternate data sources. If basis risk is revealed to be a strong presence, the next step should be to understand why WorldCover's algorithms were unable to identify the harvest losses, and to remedy such faults. 
